@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ SAE_FILENAME = "SDXL-Turbo-SAE-ldown_blocks.2.attentions.1.pt"
 QWEN_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 DEFAULT_FEATURE_IDS = [770, 4071, 4443, 6214, 7446]
 DEFAULT_SEEDS = [11, 37, 89]
+DEFAULT_CPU_WORKERS = 8
 
 
 @dataclass
@@ -84,6 +86,12 @@ def parse_args() -> argparse.Namespace:
         default=24,
         help="Number of feature/seed jobs to generate in parallel.",
     )
+    generate.add_argument(
+        "--cpu-workers",
+        type=int,
+        default=DEFAULT_CPU_WORKERS,
+        help="Number of CPU workers for image save/load work.",
+    )
 
     label = subparsers.add_parser("label", help="Label generated image triplets with Qwen2.5-VL-7B-Instruct.")
     add_shared_flags(label)
@@ -100,6 +108,12 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="Number of feature triplets to label in parallel.",
     )
+    label.add_argument(
+        "--cpu-workers",
+        type=int,
+        default=DEFAULT_CPU_WORKERS,
+        help="Number of CPU workers for image save/load work.",
+    )
 
     run = subparsers.add_parser("run", help="Run staged generation then labelling in separate subprocesses.")
     add_shared_flags(run)
@@ -110,6 +124,7 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--max-new-tokens", type=int, default=96)
     run.add_argument("--generate-batch-size", type=int, default=24)
     run.add_argument("--label-batch-size", type=int, default=8)
+    run.add_argument("--cpu-workers", type=int, default=DEFAULT_CPU_WORKERS)
 
     return parser.parse_args()
 
@@ -154,6 +169,17 @@ def write_stage_summary(output_dir: Path, summary: StageSummary) -> None:
 
 def chunked(items: list[Any], size: int) -> list[list[Any]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def save_image(image: Image.Image, image_path: str) -> None:
+    Path(image_path).parent.mkdir(parents=True, exist_ok=True)
+    image.save(image_path)
+    image.close()
+
+
+def load_rgb_image(image_path: Path) -> Image.Image:
+    with Image.open(image_path) as image:
+        return image.convert("RGB")
 
 
 def load_decoder_matrix() -> torch.Tensor:
@@ -223,28 +249,39 @@ def generate_images(args: argparse.Namespace) -> Path:
             jobs.append((feature_id, seed, feature_dir / f"seed_{seed}.png"))
 
     start_time = time.perf_counter()
-    for batch_index, batch_jobs in enumerate(chunked(jobs, args.generate_batch_size), start=1):
-        feature_ids = [feature_id for feature_id, _seed, _path in batch_jobs]
-        basis_vectors = (
-            decoder_weight[:, feature_ids].T.to(device="cuda", dtype=pipe.unet.dtype) * args.steering_scale
-        )
-        generators = [torch.Generator(device="cuda").manual_seed(seed) for _feature_id, seed, _path in batch_jobs]
-        prompts = [""] * len(batch_jobs)
-
-        with SteeringHook(target_module, basis_vectors):
-            result = pipe(
-                prompt=prompts,
-                num_inference_steps=1,
-                guidance_scale=0.0,
-                generator=generators,
-                height=args.height,
-                width=args.width,
+    save_futures: list[Future[Any]] = []
+    with ThreadPoolExecutor(max_workers=args.cpu_workers) as executor:
+        for batch_index, batch_jobs in enumerate(chunked(jobs, args.generate_batch_size), start=1):
+            feature_ids = [feature_id for feature_id, _seed, _path in batch_jobs]
+            basis_vectors = (
+                decoder_weight[:, feature_ids].T.to(device="cuda", dtype=pipe.unet.dtype) * args.steering_scale
             )
+            generators = [torch.Generator(device="cuda").manual_seed(seed) for _feature_id, seed, _path in batch_jobs]
+            prompts = [""] * len(batch_jobs)
 
-        for image, (feature_id, seed, image_path) in zip(result.images, batch_jobs):
-            image.save(image_path)
-            runs.append(FeatureRun(feature_id=feature_id, seed=seed, image_path=str(image_path)))
-        snapshot_gpu(args.output_dir, f"generate:batch_{batch_index}")
+            with SteeringHook(target_module, basis_vectors):
+                result = pipe(
+                    prompt=prompts,
+                    num_inference_steps=1,
+                    guidance_scale=0.0,
+                    generator=generators,
+                    height=args.height,
+                    width=args.width,
+                )
+
+            for image, (feature_id, seed, image_path) in zip(result.images, batch_jobs):
+                save_futures.append(executor.submit(save_image, image, str(image_path)))
+                runs.append(FeatureRun(feature_id=feature_id, seed=seed, image_path=str(image_path)))
+
+            if len(save_futures) >= args.cpu_workers * 4:
+                for future in save_futures[: args.cpu_workers * 2]:
+                    future.result()
+                save_futures = save_futures[args.cpu_workers * 2 :]
+
+            snapshot_gpu(args.output_dir, f"generate:batch_{batch_index}")
+
+        for future in save_futures:
+            future.result()
 
     elapsed = time.perf_counter() - start_time
     write_stage_summary(
@@ -347,57 +384,56 @@ def label_images(args: argparse.Namespace) -> Path:
     labels: list[dict[str, Any]] = []
     prompt = build_label_prompt()
     start_time = time.perf_counter()
-    for batch_index, feature_batch in enumerate(chunked(args.feature_ids, args.label_batch_size), start=1):
-        message_batch: list[list[dict[str, Any]]] = []
-        text_batch: list[str] = []
-        image_batch: list[list[Image.Image]] = []
-        for feature_id in feature_batch:
-            images = [Image.open(path).convert("RGB") for path in feature_triplets[feature_id]]
-            image_batch.append(images)
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "image"},
-                        {"type": "image"},
-                        {"type": "text", "text": prompt},
-                    ],
-                }
+    with ThreadPoolExecutor(max_workers=args.cpu_workers) as executor:
+        for batch_index, feature_batch in enumerate(chunked(args.feature_ids, args.label_batch_size), start=1):
+            text_batch: list[str] = []
+            load_jobs = [feature_triplets[feature_id] for feature_id in feature_batch]
+            image_batch = list(executor.map(lambda paths: [load_rgb_image(path) for path in paths], load_jobs))
+
+            for _images in image_batch:
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image"},
+                            {"type": "image"},
+                            {"type": "image"},
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ]
+                text_batch.append(processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
+
+            flat_images = [image for images in image_batch for image in images]
+            inputs = processor(text=text_batch, images=flat_images, padding=True, return_tensors="pt")
+            inputs = inputs.to(model.device)
+
+            with torch.inference_mode():
+                generated_ids = model.generate(**inputs, do_sample=False, max_new_tokens=args.max_new_tokens)
+            trimmed_ids = [
+                output_ids[len(input_ids) :]
+                for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
             ]
-            message_batch.append(messages)
-            text_batch.append(processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
-
-        flat_images = [image for images in image_batch for image in images]
-        inputs = processor(text=text_batch, images=flat_images, padding=True, return_tensors="pt")
-        inputs = inputs.to(model.device)
-
-        with torch.inference_mode():
-            generated_ids = model.generate(**inputs, do_sample=False, max_new_tokens=args.max_new_tokens)
-        trimmed_ids = [
-            output_ids[len(input_ids) :]
-            for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        responses = processor.batch_decode(
-            trimmed_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
-        for feature_id, image_paths, response in zip(feature_batch, [feature_triplets[f] for f in feature_batch], responses):
-            parsed = extract_json_blob(response)
-            labels.append(
-                {
-                    "feature_id": feature_id,
-                    "label": parsed.get("label", "").strip(),
-                    "reason": parsed.get("reason", "").strip(),
-                    "raw_response": response.strip(),
-                    "image_paths": [str(path) for path in image_paths],
-                }
+            responses = processor.batch_decode(
+                trimmed_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
             )
-        for images in image_batch:
-            for image in images:
-                image.close()
-        snapshot_gpu(args.output_dir, f"label:batch_{batch_index}")
+            for feature_id, image_paths, response in zip(feature_batch, [feature_triplets[f] for f in feature_batch], responses):
+                parsed = extract_json_blob(response)
+                labels.append(
+                    {
+                        "feature_id": feature_id,
+                        "label": parsed.get("label", "").strip(),
+                        "reason": parsed.get("reason", "").strip(),
+                        "raw_response": response.strip(),
+                        "image_paths": [str(path) for path in image_paths],
+                    }
+                )
+            for images in image_batch:
+                for image in images:
+                    image.close()
+            snapshot_gpu(args.output_dir, f"label:batch_{batch_index}")
 
     elapsed = time.perf_counter() - start_time
     write_stage_summary(
@@ -450,6 +486,8 @@ def run_staged(args: argparse.Namespace) -> None:
         str(args.width),
         "--generate-batch-size",
         str(args.generate_batch_size),
+        "--cpu-workers",
+        str(args.cpu_workers),
     ]
     subprocess.run(generate_cmd, check=True)
 
@@ -461,6 +499,8 @@ def run_staged(args: argparse.Namespace) -> None:
         str(args.max_new_tokens),
         "--label-batch-size",
         str(args.label_batch_size),
+        "--cpu-workers",
+        str(args.cpu_workers),
     ]
     subprocess.run(label_cmd, check=True)
 
@@ -468,6 +508,7 @@ def run_staged(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    torch.set_num_threads(min(args.cpu_workers, DEFAULT_CPU_WORKERS))
     if args.command == "generate":
         manifest_path = generate_images(args)
         print(f"Wrote generation manifest to {manifest_path}")
