@@ -206,8 +206,14 @@ class SteeringHook:
     def _hook(self, _module: torch.nn.Module, _inputs: tuple[Any, ...], output: Any) -> Any:
         if self.vector.ndim == 1:
             steering = self.vector.view(1, -1, 1, 1)
-        else:
+        elif self.vector.ndim == 2:
             steering = self.vector.view(self.vector.shape[0], self.vector.shape[1], 1, 1)
+        elif self.vector.ndim == 3:
+            steering = self.vector.unsqueeze(0)
+        elif self.vector.ndim == 4:
+            steering = self.vector
+        else:
+            raise ValueError(f"Unsupported steering tensor rank: {self.vector.ndim}")
         if hasattr(output, "sample"):
             output.sample = output.sample + steering
             return output
