@@ -262,6 +262,10 @@ def generate_images(args: argparse.Namespace) -> Path:
             basis_vectors = (
                 decoder_weight[:, feature_ids].T.to(device="cuda", dtype=pipe.unet.dtype) * args.steering_scale
             )
+            basis_vectors = decoder_weight[:, feature_ids].T.to(device="cuda", dtype=pipe.unet.dtype)
+            basis_vectors = basis_vectors / basis_vectors.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            basis_vectors = basis_vectors * args.steering_scale
+
             generators = [torch.Generator(device="cuda").manual_seed(seed) for _feature_id, seed, _path in batch_jobs]
             prompts = [""] * len(batch_jobs)
 
