@@ -32,6 +32,7 @@ QWEN_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 DEFAULT_FEATURE_IDS = [770, 4071, 4443, 6214, 7446]
 DEFAULT_SEEDS = [11, 37, 89]
 DEFAULT_CPU_WORKERS = 8
+DEFAULT_NUM_INFERENCE_STEPS = 2
 
 
 @dataclass
@@ -75,11 +76,23 @@ def parse_args() -> argparse.Namespace:
     generate.add_argument(
         "--steering-scale",
         type=float,
-        default=120.0,
-        help="Coefficient applied to the SAE decoder direction at down_blocks[2].attentions[1].",
+        default=1.0,
+        help="Deprecated. Autolabel generation now injects raw SAE decoder outputs with no extra scaling.",
     )
     generate.add_argument("--height", type=int, default=512)
     generate.add_argument("--width", type=int, default=512)
+    generate.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=DEFAULT_NUM_INFERENCE_STEPS,
+        help="Total denoising steps for image generation.",
+    )
+    generate.add_argument(
+        "--num-steered-steps",
+        type=int,
+        default=None,
+        help="Number of initial denoising steps whose down.2.1 activations are replaced. Defaults to num_inference_steps - 1.",
+    )
     generate.add_argument(
         "--generate-batch-size",
         type=int,
@@ -118,9 +131,11 @@ def parse_args() -> argparse.Namespace:
     run = subparsers.add_parser("run", help="Run staged generation then labelling in separate subprocesses.")
     add_shared_flags(run)
     run.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS)
-    run.add_argument("--steering-scale", type=float, default=120.0)
+    run.add_argument("--steering-scale", type=float, default=1.0)
     run.add_argument("--height", type=int, default=512)
     run.add_argument("--width", type=int, default=512)
+    run.add_argument("--num-inference-steps", type=int, default=DEFAULT_NUM_INFERENCE_STEPS)
+    run.add_argument("--num-steered-steps", type=int, default=None)
     run.add_argument("--max-new-tokens", type=int, default=96)
     run.add_argument("--generate-batch-size", type=int, default=24)
     run.add_argument("--label-batch-size", type=int, default=8)
@@ -222,6 +237,79 @@ class SteeringHook:
         return output + steering
 
 
+class ActivationReplacementHook:
+    def __init__(self, module: torch.nn.Module, replacement: torch.Tensor, num_steps: int, num_steered_steps: int):
+        if num_steps < 1:
+            raise ValueError("num_steps must be at least 1")
+        if not 0 <= num_steered_steps <= num_steps:
+            raise ValueError("num_steered_steps must be between 0 and num_steps")
+        self.module = module
+        self.replacement = replacement
+        self.num_steps = num_steps
+        self.num_steered_steps = num_steered_steps
+        self.handle: Any | None = None
+        self.call_count = 0
+        self.replaced_count = 0
+
+    def __enter__(self) -> "ActivationReplacementHook":
+        self.handle = self.module.register_forward_hook(self._hook)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.handle is not None:
+            self.handle.remove()
+            self.handle = None
+
+    def _format_replacement(self, output: Any) -> torch.Tensor:
+        if hasattr(output, "sample"):
+            target = output.sample
+        elif isinstance(output, tuple):
+            target = output[0]
+        else:
+            target = output
+
+        replacement = self.replacement
+        if replacement.ndim == 1:
+            replacement = replacement.view(1, -1, 1, 1)
+        elif replacement.ndim == 2:
+            replacement = replacement.view(replacement.shape[0], replacement.shape[1], 1, 1)
+        elif replacement.ndim == 3:
+            replacement = replacement.unsqueeze(0)
+        elif replacement.ndim != 4:
+            raise ValueError(f"Unsupported replacement tensor rank: {replacement.ndim}")
+
+        replacement = replacement.to(device=target.device, dtype=target.dtype)
+        if replacement.shape[1] != target.shape[1]:
+            raise ValueError(
+                f"Replacement channel count {replacement.shape[1]} does not match target {target.shape[1]}"
+            )
+        if replacement.shape[2:] == (1, 1) and target.ndim == 4:
+            replacement = replacement.expand(replacement.shape[0], replacement.shape[1], target.shape[2], target.shape[3])
+        if replacement.shape != target.shape:
+            raise ValueError(f"Replacement shape {replacement.shape} does not match target shape {target.shape}")
+        return replacement
+
+    def _hook(self, _module: torch.nn.Module, _inputs: tuple[Any, ...], output: Any) -> Any:
+        step_index = self.call_count
+        self.call_count += 1
+        if step_index >= self.num_steps:
+            raise RuntimeError(
+                f"Expected {self.num_steps} calls to the hooked module, but saw more than that; "
+                "step-aware replacement gating is invalid for this execution path."
+            )
+        if step_index >= self.num_steered_steps:
+            return output
+
+        replacement = self._format_replacement(output)
+        self.replaced_count += 1
+        if hasattr(output, "sample"):
+            output.sample = replacement
+            return output
+        if isinstance(output, tuple):
+            return (replacement, *output[1:])
+        return replacement
+
+
 def build_sdxl_pipeline() -> AutoPipelineForText2Image:
     pipe = AutoPipelineForText2Image.from_pretrained(
         SDXL_MODEL_ID,
@@ -244,6 +332,17 @@ def generate_images(args: argparse.Namespace) -> Path:
     decoder_weight = load_decoder_matrix()
     pipe = build_sdxl_pipeline()
     snapshot_gpu(args.output_dir, "generate:models_loaded")
+    num_steered_steps = args.num_steered_steps
+    if num_steered_steps is None:
+        num_steered_steps = max(0, args.num_inference_steps - 1)
+    if not 0 <= num_steered_steps <= args.num_inference_steps:
+        raise ValueError("--num-steered-steps must be between 0 and --num-inference-steps")
+    if args.steering_scale != 1.0:
+        print(
+            f"Warning: --steering-scale={args.steering_scale} is deprecated and ignored; "
+            "autolabel generation now uses raw decoder outputs with no extra scaling.",
+            file=sys.stderr,
+        )
 
     runs: list[FeatureRun] = []
     target_module = pipe.unet.down_blocks[2].attentions[1]
@@ -259,24 +358,33 @@ def generate_images(args: argparse.Namespace) -> Path:
     with ThreadPoolExecutor(max_workers=args.cpu_workers) as executor:
         for batch_index, batch_jobs in enumerate(chunked(jobs, args.generate_batch_size), start=1):
             feature_ids = [feature_id for feature_id, _seed, _path in batch_jobs]
-            basis_vectors = (
-                decoder_weight[:, feature_ids].T.to(device="cuda", dtype=pipe.unet.dtype) * args.steering_scale
-            )
             basis_vectors = decoder_weight[:, feature_ids].T.to(device="cuda", dtype=pipe.unet.dtype)
-            basis_vectors = basis_vectors / basis_vectors.norm(dim=1, keepdim=True).clamp_min(1e-8)
-            basis_vectors = basis_vectors * args.steering_scale
 
             generators = [torch.Generator(device="cuda").manual_seed(seed) for _feature_id, seed, _path in batch_jobs]
             prompts = [""] * len(batch_jobs)
 
-            with SteeringHook(target_module, basis_vectors):
+            with ActivationReplacementHook(
+                target_module,
+                basis_vectors,
+                num_steps=args.num_inference_steps,
+                num_steered_steps=num_steered_steps,
+            ) as hook:
                 result = pipe(
                     prompt=prompts,
-                    num_inference_steps=1,
+                    num_inference_steps=args.num_inference_steps,
                     guidance_scale=0.0,
                     generator=generators,
                     height=args.height,
                     width=args.width,
+                )
+            if hook.call_count != args.num_inference_steps:
+                raise RuntimeError(
+                    f"Expected hooked module to run once per denoising step "
+                    f"({args.num_inference_steps} calls), but saw {hook.call_count}."
+                )
+            if hook.replaced_count != num_steered_steps:
+                raise RuntimeError(
+                    f"Expected {num_steered_steps} replacement steps, but saw {hook.replaced_count}."
                 )
 
             for image, (feature_id, seed, image_path) in zip(result.images, batch_jobs):
@@ -309,9 +417,13 @@ def generate_images(args: argparse.Namespace) -> Path:
         "model_id": SDXL_MODEL_ID,
         "sae_repo_id": SAE_REPO_ID,
         "sae_filename": SAE_FILENAME,
-        "steering_scale": args.steering_scale,
+        "activation_mode": "replace",
+        "injection_target": "down_blocks[2].attentions[1]",
+        "steering_source": "sae_decoder_raw",
         "height": args.height,
         "width": args.width,
+        "num_inference_steps": args.num_inference_steps,
+        "num_steered_steps": num_steered_steps,
         "generate_batch_size": args.generate_batch_size,
         "feature_runs": [asdict(run) for run in runs],
     }
@@ -494,6 +606,9 @@ def run_staged(args: argparse.Namespace) -> None:
         str(args.height),
         "--width",
         str(args.width),
+        "--num-inference-steps",
+        str(args.num_inference_steps),
+        *([] if args.num_steered_steps is None else ["--num-steered-steps", str(args.num_steered_steps)]),
         "--generate-batch-size",
         str(args.generate_batch_size),
         "--cpu-workers",
